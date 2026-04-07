@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+stories.json
+*.log
+*.Zone.Identifier
+*:Zone.Identifier
