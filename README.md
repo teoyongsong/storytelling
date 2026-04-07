@@ -28,7 +28,20 @@ streamlit run app.py
 
 - `stories.json` (auto-created on first story generation)
 
+## OpenAI (optional)
+
+In the app sidebar, choose **OpenAI** and either:
+
+- set `OPENAI_API_KEY` in your environment, or
+- paste an API key in the sidebar (only shown when needed), or
+- on Streamlit Cloud: **App settings → Secrets** with:
+
+```toml
+OPENAI_API_KEY = "sk-..."
+```
+
+If you pick **Local template**, no API key is required.
+
 ## Notes
 
-- Current implementation uses a local template-based story generator.
-- To upgrade, replace `generate_story()` in `app.py` with an LLM API call.
+- Default generation is a local template; OpenAI uses the Chat Completions API (`generate_story_openai` in `app.py`).

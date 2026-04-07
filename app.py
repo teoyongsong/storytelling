@@ -5,8 +5,32 @@ from pathlib import Path
 
 import streamlit as st
 
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
 
 DATA_FILE = Path("stories.json")
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+
+
+def _get_secret(key: str):
+    try:
+        return st.secrets.get(key)
+    except (FileNotFoundError, RuntimeError, AttributeError):
+        return None
+
+
+def resolve_openai_key(pasted: str | None) -> str | None:
+    for candidate in (
+        _get_secret("OPENAI_API_KEY"),
+        os.environ.get("OPENAI_API_KEY"),
+        pasted,
+    ):
+        if candidate and str(candidate).strip():
+            return str(candidate).strip()
+    return None
 
 
 def load_data():
@@ -21,7 +45,7 @@ def save_data(data):
         json.dump(data, f, indent=2)
 
 
-def generate_story(params):
+def generate_story_template(params):
     age_range = params["age_range"]
     child_name = params["child_name"]
     protagonist = params["protagonist"]
@@ -65,6 +89,72 @@ def generate_story(params):
     return story
 
 
+def build_openai_user_prompt(params: dict) -> str:
+    return f"""Write a children's story with these parameters:
+- Audience age band: {params['age_range']} years (adjust vocabulary, length, and emotional intensity accordingly).
+- Child name (can appear as a character or be addressed gently): {params['child_name']}
+- Main character: {params['protagonist']}
+- Personality traits: {params['traits']}
+- Setting: {params['setting']}
+- Theme: {params['theme']}
+- Moral lesson to land naturally (not preachy): {params['moral']}
+
+Requirements:
+- Positive, age-appropriate tone; no graphic violence or scary horror.
+- Clear narrative arc across the sections below.
+- Use markdown with EXACTLY these headings (and nothing before the first heading except a blank line if needed):
+
+## Introduction
+
+## Challenge
+
+## Resolution
+
+## Moral
+
+## Scene prompts (for illustrators)
+
+Under "## Scene prompts (for illustrators)", add exactly three bullet lines starting with "- " describing distinct illustration moments (one sentence each)."""
+
+
+def parse_story_and_scenes(full_text: str, params: dict) -> tuple[str, list[str]]:
+    marker = "## Scene prompts (for illustrators)"
+    if marker not in full_text:
+        return full_text.strip(), scene_descriptions(params)
+    story_part, scenes_part = full_text.split(marker, 1)
+    scenes = []
+    for line in scenes_part.splitlines():
+        line = line.strip()
+        if line.startswith("- "):
+            scenes.append(line[2:].strip())
+    if len(scenes) < 3:
+        return full_text.strip(), scene_descriptions(params)
+    return story_part.strip(), scenes[:3]
+
+
+def generate_story_openai(api_key: str, params: dict, model: str) -> tuple[str, list[str]]:
+    if OpenAI is None:
+        raise RuntimeError("Install the openai package: pip install openai")
+
+    client = OpenAI(api_key=api_key)
+    completion = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a skilled children's storyteller. "
+                    "Follow the user's output format exactly. Write only the story markdown requested."
+                ),
+            },
+            {"role": "user", "content": build_openai_user_prompt(params)},
+        ],
+        temperature=0.8,
+    )
+    raw = (completion.choices[0].message.content or "").strip()
+    return parse_story_and_scenes(raw, params)
+
+
 def scene_descriptions(params):
     return [
         f"Chapter 1 illustration: {params['protagonist']} and {params['child_name']} arriving at {params['setting']} at sunset.",
@@ -88,6 +178,32 @@ def main():
     tab_create, tab_library, tab_dashboard = st.tabs(
         ["Create Story", "Child Story Library", "Parent Dashboard"]
     )
+
+    with st.sidebar:
+        st.header("Generation")
+        gen_mode = st.radio(
+            "Story source",
+            ["Local template", "OpenAI"],
+            horizontal=True,
+        )
+        openai_model = DEFAULT_OPENAI_MODEL
+        openai_key_input = ""
+        if gen_mode == "OpenAI":
+            openai_model = st.text_input(
+                "OpenAI model",
+                value=DEFAULT_OPENAI_MODEL,
+                help="e.g. gpt-4o-mini, gpt-4o",
+            )
+            key_from_env = bool(resolve_openai_key(None))
+            openai_key_input = st.text_input(
+                "OpenAI API key",
+                type="password",
+                value="",
+                help="Optional if OPENAI_API_KEY is set in environment or Streamlit secrets.",
+                disabled=key_from_env,
+            )
+            if key_from_env:
+                st.caption("Using OPENAI_API_KEY from secrets or environment.")
 
     with tab_create:
         st.subheader("Story Parameter Builder")
@@ -126,9 +242,27 @@ def main():
                     "setting": setting.strip(),
                     "theme": theme.strip(),
                     "moral": moral.strip(),
+                    "generation": gen_mode,
                 }
-                story_text = generate_story(params)
-                scenes = scene_descriptions(params)
+                try:
+                    if gen_mode == "OpenAI":
+                        api_key = resolve_openai_key(openai_key_input or None)
+                        if not api_key:
+                            st.error(
+                                "OpenAI selected but no API key found. "
+                                "Set OPENAI_API_KEY in Streamlit secrets or environment, or paste a key above."
+                            )
+                            st.stop()
+                        model = (openai_model or DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
+                        with st.spinner("Generating with OpenAI…"):
+                            story_text, scenes = generate_story_openai(api_key, params, model)
+                        params["openai_model"] = model
+                    else:
+                        story_text = generate_story_template(params)
+                        scenes = scene_descriptions(params)
+                except Exception as e:
+                    st.error(f"Generation failed: {e}")
+                    st.stop()
 
                 ensure_profile(data, params["child_name"])
                 data["stories"].append(
@@ -187,7 +321,8 @@ def main():
 
     st.divider()
     st.caption(
-        "Note: This MVP uses a local template generator. Replace generate_story() with an LLM API call for fully dynamic story generation."
+        "Use the sidebar to choose Local template or OpenAI. "
+        "For deployment, set OPENAI_API_KEY in Streamlit Cloud → App settings → Secrets."
     )
 
 
