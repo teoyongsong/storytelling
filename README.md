@@ -10,6 +10,8 @@ This app is built from `11-OnceUpon.md` and implements a beginner-friendly MVP o
 - Structured output sections
   - Introduction, Challenge, Resolution, Moral
 - Illustrated chapter break prompts (scene descriptions)
+- Optional images per chapter (Introduction, Challenge, Resolution), saved with the story
+- Download a **complete storybook** as one HTML file (text + images + scene captions); open in a browser or print to PDF
 - Story persistence in local JSON storage
 - Child profile story library
 - Parent dashboard with generation history
@@ -26,7 +28,9 @@ streamlit run app.py
 
 ## Data storage
 
-- `stories.json` (auto-created on first story generation)
+- Stories are saved next to the app: `stories.json` in the same folder as `app.py` (not the shell’s current directory).
+- The app keeps a copy in browser session state so stories still show after a rerun even if disk write fails briefly.
+- **Streamlit Cloud**: the filesystem is ephemeral; stories can disappear after the app sleeps or redeploys. Use **Manage app → Reboot** awareness, or add an external database later for permanent cloud storage.
 
 ## OpenAI (optional)
 

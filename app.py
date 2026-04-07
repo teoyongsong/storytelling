@@ -1,9 +1,17 @@
+import base64
+import html as html_module
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+
+try:
+    import markdown as md_lib
+except ImportError:
+    md_lib = None
 
 try:
     from openai import OpenAI
@@ -11,8 +19,9 @@ except ImportError:
     OpenAI = None
 
 
-DATA_FILE = Path("stories.json")
+DATA_FILE = Path(__file__).resolve().parent / "stories.json"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+SESSION_DATA_KEY = "app_data"
 
 
 def _get_secret(key: str):
@@ -33,16 +42,39 @@ def resolve_openai_key(pasted: str | None) -> str | None:
     return None
 
 
-def load_data():
-    if not DATA_FILE.exists():
-        return {"profiles": {}, "stories": []}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+def load_data_from_disk():
+    if DATA_FILE.exists():
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    # Legacy: older versions wrote stories.json relative to process cwd
+    legacy = Path.cwd() / "stories.json"
+    if legacy.exists():
+        try:
+            with open(legacy, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"profiles": {}, "stories": []}
 
 
 def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    try:
+        DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError as e:
+        st.warning(
+            f"Could not write {DATA_FILE}: {e}. "
+            "Stories still apply for this browser session. "
+            "On Streamlit Cloud, disk may be read-only or reset when the app sleeps."
+        )
+
+
+def get_app_data():
+    """Single in-memory copy so reruns do not drop stories if disk path or write fails."""
+    if SESSION_DATA_KEY not in st.session_state:
+        st.session_state[SESSION_DATA_KEY] = load_data_from_disk()
+    return st.session_state[SESSION_DATA_KEY]
 
 
 def generate_story_template(params):
@@ -163,6 +195,119 @@ def scene_descriptions(params):
     ]
 
 
+def normalize_illustrations(item: dict) -> list:
+    raw = item.get("illustration_images")
+    if not raw:
+        return [None, None, None]
+    out = list(raw)
+    while len(out) < 3:
+        out.append(None)
+    return out[:3]
+
+
+def split_story_sections(md: str) -> list[tuple[str, str]]:
+    """Split markdown into (heading, body) pairs. First chunk may have empty heading (preamble)."""
+    pattern = r"^##\s+(.+)$"
+    bits = re.split(pattern, md, flags=re.MULTILINE)
+    out: list[tuple[str, str]] = []
+    if bits[0].strip():
+        out.append(("", bits[0].strip()))
+    for i in range(1, len(bits), 2):
+        heading = bits[i].strip()
+        body = bits[i + 1].strip() if i + 1 < len(bits) else ""
+        out.append((heading, body))
+    return out
+
+
+def md_to_html_fragment(text: str) -> str:
+    if not text:
+        return ""
+    if md_lib is None:
+        return f"<p>{html_module.escape(text).replace(chr(10), '<br/>')}</p>"
+    try:
+        return md_lib.markdown(text, extensions=["nl2br", "fenced_code"])
+    except Exception:
+        return md_lib.markdown(text)
+
+
+def illustration_figure(img: dict | None, caption: str | None) -> str:
+    if not img or not img.get("b64"):
+        return ""
+    mime = img.get("mime") or "image/png"
+    cap = ""
+    if caption:
+        cap = f"<figcaption>{html_module.escape(caption)}</figcaption>"
+    return (
+        f'<figure class="illustration">'
+        f'<img src="data:{html_module.escape(mime)};base64,{img["b64"]}" alt="Illustration"/>'
+        f"{cap}</figure>"
+    )
+
+
+def image_slot_for_heading(heading: str) -> int | None:
+    key = heading.strip().lower()
+    return {"introduction": 0, "challenge": 1, "resolution": 2}.get(key)
+
+
+def build_storybook_html(item: dict) -> str:
+    params = item["params"]
+    title = html_module.escape(
+        f"Once Upon — {params.get('child_name', 'Story')} ({params.get('theme', '')})"
+    )
+    subtitle = html_module.escape(
+        f"{params.get('setting', '')} · Ages {params.get('age_range', '')}"
+    )
+    sections = split_story_sections(item.get("story") or "")
+    imgs = normalize_illustrations(item)
+    scenes = item.get("scene_descriptions") or []
+
+    parts: list[str] = []
+    for heading, body in sections:
+        if heading:
+            parts.append(f"<h2>{html_module.escape(heading)}</h2>")
+        else:
+            parts.append('<div class="preamble">')
+            parts.append(md_to_html_fragment(body))
+            parts.append("</div>")
+            continue
+        parts.append(md_to_html_fragment(body))
+        slot = image_slot_for_heading(heading)
+        if slot is not None and imgs[slot]:
+            cap = scenes[slot] if slot < len(scenes) else None
+            parts.append(illustration_figure(imgs[slot], cap))
+
+    body_html = "\n".join(parts)
+    css = """
+    :root { font-family: Georgia, "Times New Roman", serif; color: #222; }
+    body { max-width: 40rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.55; }
+    h1 { font-size: 1.6rem; margin-bottom: 0.25rem; }
+    .subtitle { color: #555; margin-bottom: 2rem; font-size: 0.95rem; }
+    h2 { font-size: 1.25rem; margin-top: 1.75rem; border-bottom: 1px solid #ddd; padding-bottom: 0.25rem; }
+    .preamble { font-style: italic; color: #444; margin-bottom: 1rem; }
+    .illustration { margin: 1.25rem 0; text-align: center; }
+    .illustration img { max-width: 100%; height: auto; border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,0.12); }
+    .illustration figcaption { font-size: 0.85rem; color: #555; margin-top: 0.5rem; }
+    """
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>{title}</title>
+<style>{css}</style>
+</head>
+<body>
+<header>
+<h1>{title}</h1>
+<p class="subtitle">{subtitle}</p>
+</header>
+<article>
+{body_html}
+</article>
+</body>
+</html>"""
+
+
 def ensure_profile(data, child_name):
     if child_name not in data["profiles"]:
         data["profiles"][child_name] = {"created_at": datetime.utcnow().isoformat()}
@@ -173,7 +318,7 @@ def main():
     st.title("📚 Once Upon")
     st.caption("AI-Powered Personalized Children's Storytelling App (MVP)")
 
-    data = load_data()
+    data = get_app_data()
 
     tab_create, tab_library, tab_dashboard = st.tabs(
         ["Create Story", "Child Story Library", "Parent Dashboard"]
@@ -301,8 +446,68 @@ def main():
                         )
                         st.markdown(item["story"])
                         st.markdown("**Scene prompts:**")
-                        for scene in item["scene_descriptions"]:
+                        for scene in item.get("scene_descriptions") or []:
                             st.write(f"- {scene}")
+
+                        st.markdown("---")
+                        st.markdown("**Illustrations**")
+                        st.caption(
+                            "Add one image per chapter (Introduction, Challenge, Resolution). "
+                            "They are woven into the exported storybook below the matching section."
+                        )
+                        stored = normalize_illustrations(item)
+                        new_imgs: list = []
+                        cols = st.columns(3)
+                        for i in range(3):
+                            with cols[i]:
+                                label = f"Chapter {i + 1}"
+                                up = st.file_uploader(
+                                    label,
+                                    type=["png", "jpg", "jpeg", "webp"],
+                                    key=f"illu_{item['timestamp']}_{i}",
+                                    help="Optional image for this chapter",
+                                )
+                                if up is not None:
+                                    new_imgs.append(
+                                        {
+                                            "mime": up.type or "image/png",
+                                            "b64": base64.b64encode(up.getvalue()).decode("ascii"),
+                                        }
+                                    )
+                                else:
+                                    new_imgs.append(stored[i])
+
+                        if new_imgs != stored:
+                            item["illustration_images"] = new_imgs
+                            save_data(data)
+
+                        thumbs = normalize_illustrations(item)
+                        if any(thumbs):
+                            st.caption("Preview")
+                            pc = st.columns(3)
+                            for i in range(3):
+                                if thumbs[i]:
+                                    with pc[i]:
+                                        st.image(
+                                            base64.b64decode(thumbs[i]["b64"]),
+                                            caption=f"Chapter {i + 1}",
+                                            use_container_width=True,
+                                        )
+
+                        st.markdown("**Complete storybook**")
+                        st.caption(
+                            "Download a single HTML file: story text plus images in reading order. "
+                            "Open in a browser; use Print → Save as PDF if you want a PDF."
+                        )
+                        html_doc = build_storybook_html(item)
+                        safe_ts = re.sub(r"[^\w\-]+", "_", item["timestamp"])[:32]
+                        st.download_button(
+                            "Download storybook (HTML)",
+                            data=html_doc.encode("utf-8"),
+                            file_name=f"once_upon_storybook_{safe_ts}.html",
+                            mime="text/html",
+                            key=f"dl_{item['timestamp']}",
+                        )
 
     with tab_dashboard:
         st.subheader("Parent Dashboard")
